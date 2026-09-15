@@ -1,0 +1,19 @@
+[Unit]
+Description=Force a suspend/resume cycle before login to fix MSHybrid OLED backlight control
+# Must complete (or no-op) before the login screen appears -- this is what
+# makes the whole thing invisible in normal use.
+Before=display-manager.service
+DefaultDependencies=no
+After=systemd-logind.service
+Requires=systemd-logind.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oled-mshybrid-backlight-fixup.sh
+RemainAfterExit=yes
+# Don't block boot forever if suspend/resume somehow hangs -- fail open
+# rather than leave the machine stuck before ever reaching a login screen.
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

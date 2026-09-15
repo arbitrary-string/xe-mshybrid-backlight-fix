@@ -1,0 +1,45 @@
+--- a/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
++++ b/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
+@@ -586,8 +586,28 @@
+ 			panel->backlight.level = current_level;
+ 			panel->backlight.enabled = panel->backlight.level != 0;
+ 		} else {
++			/*
++			 * Firmware leaves this panel's TCON in legacy PWM
++			 * mode at boot, not DPCD mode -- normally
++			 * intel_dp_aux_vesa_enable_backlight() (which writes
++			 * BACKLIGHT_MODE_SET_REGISTER to actually switch the
++			 * TCON into DPCD mode) fixes this, but atomic state
++			 * readout at boot sees the encoder already enabled
++			 * (inherited from the firmware-lit panel) and skips
++			 * calling it -- confirmed live: brightness control
++			 * silently does nothing until the next full
++			 * enable cycle (e.g. a suspend/resume), which isn't
++			 * skippable and always calls it. Do the same AUX
++			 * mode-switch + initial level write right here
++			 * instead, since setup (unlike enable) always runs
++			 * at boot regardless of that optimization.
++			 */
+ 			panel->backlight.level = panel->backlight.max;
+ 			panel->backlight.enabled = false;
++			drm_edp_backlight_enable(&intel_dp->aux,
++						  &panel->backlight.edp.vesa.info,
++						  panel->backlight.level);
++			panel->backlight.enabled = true;
+ 		}
+ 	} else {
+ 		panel->backlight.max = panel->backlight.pwm_level_max;
+@@ -615,12 +635,7 @@
+ 	int ret;
+ 	u8 bit_min, bit_max;
+ 
+-	/*
+-	 * Since we only support Fully AUX Based VESA Backlight interface make sure
+-	 * backlight enable is possible via AUX along with backlight adjustment
+-	 */
+-	if (!(intel_dp->edp_dpcd[1] & DP_EDP_BACKLIGHT_AUX_ENABLE_CAP &&
+-	      intel_dp->edp_dpcd[2] & DP_EDP_BACKLIGHT_BRIGHTNESS_AUX_SET_CAP))
++	if (!(intel_dp->edp_dpcd[2] & DP_EDP_BACKLIGHT_BRIGHTNESS_AUX_SET_CAP))
+ 		return false;
+ 
+ 	ret = drm_dp_dpcd_read_byte(&intel_dp->aux, DP_EDP_PWMGEN_BIT_COUNT_CAP_MIN, &bit_min);

@@ -1,0 +1,269 @@
+# xe-mshybrid-backlight-fix
+
+Real, hardware OLED brightness control in MSHybrid mode (Intel `xe` GPU
+driving the panel, NVIDIA dGPU present as a PRIME `on-demand` offload
+device) on a Clevo/Tongfang laptop barebone whose eDP panel doesn't set
+`DP_EDP_BACKLIGHT_AUX_ENABLE_CAP`, and whose firmware hands the panel to
+the OS already lit — two separate issues Ubuntu's shipped `xe.ko` gets
+wrong on its own, plus a third, genuinely surprising one: with an NVIDIA
+GPU also present in `on-demand` mode, `xe` never actually switches the
+panel into DPCD-controlled backlight mode at cold boot at all, no matter
+what the driver source does — until this repo's `xe-after-nvidia.conf`
+fixes it by controlling kernel module load order.
+
+Without any of this, the brightness slider silently does nothing in
+MSHybrid mode: writes succeed as DisplayPort AUX-channel transactions,
+but the panel's own controller (TCON) is still listening to the legacy
+PWM brightness pin, not the AUX channel, so it never reacts.
+
+## Is this relevant to your hardware?
+
+The **kernel source patch** (`oled-mshybrid-backlight.patch`) fixes two
+bugs in `drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c` (shared
+display code used by both `i915` and `xe`) that plausibly affect *any*
+eDP panel with the same DPCD capability-bit quirk, on any Intel GPU
+using this driver path — not specific to this exact board. Bug 1
+(missing `DP_EDP_BACKLIGHT_AUX_ENABLE_CAP` check removal) was already
+fixed upstream on 2026-07-16 in commit `a411ea4a87`
+("Remove DP_EDP_BACKLIGHT_AUX_ENABLE_CAP check for DPCD backlight") --
+check if your kernel already has it before patching. Bug 2 (the
+boot-time atomic-readout skip) may or may not be fixed upstream; check
+the "Verifying whether a future kernel already has the fix" section
+below either way.
+
+The **modprobe load-order fix** (`xe-after-nvidia.conf`) is the more
+speculative part: it's confirmed, reproducibly, on this exact
+Panther-Lake-`xe` + NVIDIA-Optimus/MSHybrid-mux laptop, but the deeper
+mechanism (why NVIDIA's `nvidia_drm` module registering its own parallel
+connector for the same physical panel interferes with `xe`'s atomic
+state machine) isn't fully understood at the kernel-source level -- see
+"How this was found" below. If you have a similar Intel+NVIDIA hybrid
+graphics laptop with the same "brightness works after suspend/resume
+but not from a cold boot, only in `on-demand` mode" symptom, it's very
+likely worth trying, but board-specific quirks are always possible.
+
+## Prerequisites (clean Ubuntu install)
+
+- A currently-installed, currently-running kernel matching the
+  `linux-image-unsigned-<version>` package you intend to patch (this was
+  developed against `7.0.0-31-generic`; adjust for whatever version you
+  have -- `uname -r`).
+- Matching headers: `sudo apt install linux-headers-$(uname -r)`
+- `deb-src` enabled in your apt sources, so `apt-get source` can fetch
+  full kernel source (not just headers) -- on modern Ubuntu (deb822
+  `.sources` format), add `deb-src` to the `Types:` line in
+  `/etc/apt/sources.list.d/ubuntu.sources`, then `sudo apt-get update`.
+- Build tooling: `sudo apt install build-essential bc flex bison libssl-dev
+  libelf-dev dwarves zstd`
+- ~15GB free disk space temporarily (kernel source + a full `vmlinux`
+  build; cleaned up automatically except for the final small patched
+  module and a backup of the original).
+- For the modprobe fix specifically: NVIDIA's proprietary driver
+  installed with the `nvidia_drm`/`nvidia_modeset`/`nvidia` kernel
+  modules (i.e. `ubuntu-drivers`/`nvidia-driver-<version>`, not the
+  open-source `nouveau` driver), and `prime-select` available
+  (`nvidia-prime` package).
+
+## Usage
+
+```
+git clone https://github.com/arbitrary-string/xe-mshybrid-backlight-fix.git
+cd xe-mshybrid-backlight-fix
+sudo ./rebuild-and-install.sh              # defaults to `uname -r`
+sudo ./rebuild-and-install.sh 7.0.0-31-generic   # or target a specific kernel
+sudo reboot
+```
+
+This one script does everything:
+1. Fetches the exact matching kernel source via `apt-get source`.
+2. Applies `oled-mshybrid-backlight.patch` (skips if already applied --
+   safe to re-run).
+3. Builds `xe.ko` against your exact running config (builds `vmlinux`
+   first for symbol resolution, then the whole `drivers/gpu/drm/`
+   subtree, since `xe.ko` links against several other DRM helper
+   modules -- both confirmed necessary, this isn't a quick single-module
+   out-of-tree build).
+4. Backs up whatever module is currently installed for that kernel
+   version (once, the first time), then installs the patched one,
+   `depmod`/`update-initramfs`.
+5. Installs `xe-after-nvidia.conf` to `/etc/modprobe.d/` and re-runs
+   `depmod` -- this is the load-order fix, needed independently of the
+   source patch above.
+6. If an older version of this project's own boot-time suspend/resume
+   workaround (see "Superseded approach" below) is present, disables and
+   removes it.
+
+Safe to re-run for the same kernel version; re-run after every future
+kernel update that replaces the currently-patched kernel, before
+rebooting into it -- if you forget, the panel just falls back to dim,
+non-functional legacy PWM control (a safe failure mode, not a
+boot-breaking one).
+
+**Not packaged as DKMS.** `xe.ko` doesn't fit DKMS's usual model at all
+-- it needs the full matching kernel source (not just the
+`/usr/src/linux-headers-*` package DKMS normally builds against), a
+fully-built `vmlinux`, and the whole `drivers/gpu/drm/` subtree built
+alongside it for cross-module symbol resolution. A DKMS package
+replicating that would mean a multi-minute, multi-GB, internet-dependent
+rebuild on every kernel update, with a real chance of the patch someday
+failing to apply cleanly against changed upstream/Ubuntu source --
+deliberately chose this manual, transparent, run-when-needed script
+instead.
+
+## Files
+
+- `oled-mshybrid-backlight.patch` -- the kernel source patch (see
+  "What the patch does" below).
+- `rebuild-and-install.sh` -- fetches, patches, builds, and installs
+  everything, including the fix below.
+- `xe-after-nvidia.conf` -- the modprobe load-order fix. Installed to
+  `/etc/modprobe.d/`. Read the extensive comments in this file for the
+  full investigation into *why* this is needed and how it was narrowed
+  down -- genuinely the most interesting part of this repo.
+- `oled-mshybrid-backlight-fixup.service`, `.sh`,
+  `oled-mshybrid-fixup-wake-arm.sh` -- an earlier, superseded fix
+  attempt (forcing a real suspend/resume cycle before the login screen
+  appears, since that also independently fixes the symptom). Kept for
+  reference / as a fallback approach in case a future kernel or NVIDIA
+  driver update ever breaks the modprobe-ordering fix. **Not installed
+  by `rebuild-and-install.sh`** as of the version in this repo.
+
+## What the patch does
+
+Two independent bugs in the same function chain
+(`intel_dp_aux_vesa_setup_backlight()`/`_enable_backlight()`/
+`_check_support()`), in `drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c`:
+
+1. `intel_dp_aux_vesa_check_support()` required both
+   `DP_EDP_BACKLIGHT_AUX_ENABLE_CAP` and
+   `DP_EDP_BACKLIGHT_BRIGHTNESS_AUX_SET_CAP` to be set in the panel's
+   DPCD capabilities before enabling AUX-based backlight control at
+   all. This exact panel sets the second bit but not the first --
+   confirmed via direct DPCD capability reads -- so the driver silently
+   fell back to the legacy (much lower resolution) PWM-based brightness
+   path entirely. Already fixed upstream as of 2026-07-16 (commit
+   `a411ea4a87`); this patch just drops the same check for kernels that
+   predate that fix.
+2. Even with (1) fixed, boot-time DRM atomic state readout sees the
+   panel already lit by firmware and skips the encoder's `enable`
+   callback (`intel_dp_aux_vesa_enable_backlight()`) -- the one that
+   actually writes `DP_EDP_BACKLIGHT_MODE_SET_REGISTER` (DPCD `0x721`)
+   to switch the panel's TCON from legacy PWM into DPCD-controlled
+   mode. Without that write, subsequent brightness writes to DPCD
+   `0x722`/`0x723` succeed as AUX transactions but the panel ignores
+   them, since its TCON is still in PWM mode. This patch moves the same
+   AUX mode-switch + initial-level write into
+   `intel_dp_aux_vesa_setup_backlight()` instead, which (unlike
+   `enable`) always runs at boot regardless of that atomic-readout
+   optimization.
+
+### Verifying whether a future kernel already has this fix built in
+
+Worth checking before re-patching a new kernel version: enable
+`drm.debug` (`echo 0x106 | sudo tee /sys/module/drm/parameters/debug`),
+clear `dmesg` (`sudo dmesg -C`), write a value to
+`/sys/class/backlight/intel_backlight/brightness`, and check whether it
+visibly changes the panel, and whether `max_brightness` reads a
+DPCD-derived scale (e.g. `4095`, a 12-bit AUX-VESA range) rather than a
+much larger legacy PWM scale (`96000` on this exact panel -- will vary
+by panel).
+
+## What the modprobe fix does, and how it was found
+
+Even with both source-patch bugs fixed, real brightness control still
+didn't durably take effect from a cold boot -- only a genuine
+suspend/resume cycle fixed it, every time. The actual root cause,
+confirmed live through direct experimentation rather than kernel-source
+reading alone:
+
+- This only ever happens with NVIDIA's proprietary driver loaded in
+  PRIME `on-demand` mode (`prime-select on-demand`) -- never with
+  `prime-select intel` (NVIDIA fully unloaded). Confirmed across
+  multiple consecutive cold boots each way.
+- `on-demand` mode uniquely creates a **second** DRM connector
+  (`card1-eDP-2`, owned by `nvidia_drm`) for the *same physical panel*
+  that `xe` (`card0-eDP-1`) exclusively drives in MSHybrid mode --
+  visible via `ls /sys/class/drm/`.
+- Kernel function tracing (`ftrace`, function tracer, filtered to
+  `intel_dp_aux_vesa_{enable,disable,set,get,setup}_backlight`) showed
+  `intel_dp_aux_vesa_enable_backlight` -- the function that actually
+  performs the DPCD mode-switch write -- genuinely never gets called at
+  all at cold boot in `on-demand` mode. Not called-and-failing: simply
+  skipped by `xe`'s own atomic-check decision of whether anything needs
+  to change. A real suspend/resume calls `disable_backlight` then
+  `enable_backlight` as part of the normal DRM atomic modeset flow, and
+  that's what actually fixes it.
+- Connector-level sysfs (`status`/`enabled`/`dpms` on both connectors)
+  is identical in both the broken and fixed states -- ruling out a
+  simple "wrong connector marked connected" theory. Whatever
+  `nvidia_drm`'s parallel connector disturbs, it's something feeding
+  `xe`'s atomic-check computation more subtly than that (plausibly
+  EDID/mode data read during its own probe, though this wasn't
+  confirmed at the kernel-source level).
+- Controlling module load order via `modprobe.d` was the empirical fix,
+  found by trial: forcing `nvidia_drm` to load first (with, and without,
+  an explicit delay before it) did **not** fix it. Forcing `xe` to load
+  first, with a real delay before `nvidia_drm` loads, fixed it
+  completely -- confirmed reliably across 4 consecutive boots (2 full
+  shutdown+power-on cycles, 2 warm reboots).
+
+`xe-after-nvidia.conf`:
+```
+softdep nvidia_drm pre: xe
+install xe /sbin/modprobe --ignore-install xe && sleep 5
+```
+Take the "5 seconds" as "generous, not exact" -- in practice `xe` loads
+at its own normal early time regardless (via its own independent udev
+trigger, not through this softdep chain), and what this rule actually
+delays is `nvidia_drm.ko`'s own insertion, which lands several seconds
+after `xe` starts, not exactly 5 seconds after. The practical effect --
+`nvidia_drm`'s connector registration happening well after `xe` has
+completed its own atomic modeset -- is what matters.
+
+## Superseded approach: boot-time suspend/resume fixup
+
+Before the modprobe fix above was found, this repo used a different
+workaround that also fixes the symptom (since a real suspend/resume
+cycle independently works, as established above): a `oneshot` systemd
+service, ordered `Before=display-manager.service`, that forces one real
+suspend/resume cycle before the login screen ever appears -- invisible
+in normal use, but at the cost of real boot-time delay (several seconds
+to tens of seconds, depending on hardware-specific suspend/resume
+overhead).
+
+This is **no longer installed** by `rebuild-and-install.sh`, but the
+files are kept in this repo (`oled-mshybrid-backlight-fixup.service`,
+`.sh`, `oled-mshybrid-fixup-wake-arm.sh`) in case a future kernel or
+NVIDIA driver update ever breaks the modprobe-ordering fix and this
+fallback is needed again. If you do need it: install
+`oled-mshybrid-backlight-fixup.sh` to `/usr/local/sbin/`,
+`oled-mshybrid-backlight-fixup.service` to `/etc/systemd/system/`,
+`oled-mshybrid-fixup-wake-arm.sh` to
+`/usr/lib/systemd/system-sleep/`, then `systemctl daemon-reload &&
+systemctl enable oled-mshybrid-backlight-fixup.service`.
+
+Two real, independent bugs were found and fixed in this mechanism along
+the way, both still worth knowing about if you reuse this pattern
+elsewhere:
+
+1. Its RTC wake alarm (`rtcwake`) needs to be armed via a *separate*
+   `system-sleep` hook that actively waits for confirmation that
+   whatever's slow in your own pre-suspend hooks has actually finished,
+   not from the triggering script itself before calling
+   `systemctl suspend` -- `man systemd-suspend.service` confirms
+   `/usr/lib/systemd/system-sleep/` scripts all run in **parallel**, so
+   naming a hook to sort after another one alphabetically does not make
+   it run after that other script's work actually completes.
+2. A signal used to nudge a long-running daemon (in this project's case,
+   `SIGUSR1`) needs to be explicitly ignored from the very first line of
+   that daemon's `main()`, before any slow startup work, or an early
+   signal arriving during that window hits Python's/the language
+   runtime's default disposition (commonly: terminate the process)
+   instead of being handled gracefully once the daemon actually installs
+   its real signal handler.
+
+## License
+
+GPL-2.0-or-later (see `LICENSE`) -- `oled-mshybrid-backlight.patch`
+modifies GPL-2.0-only Linux kernel source, so this project is licensed
+to match.

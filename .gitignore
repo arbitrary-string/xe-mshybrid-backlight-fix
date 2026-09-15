@@ -1,0 +1,15 @@
+# Build artifacts created by rebuild-and-install.sh: downloaded kernel
+# source (tens of GB once extracted/built), staged output, and backups
+# of the stock module. None of this is meant to be version-controlled --
+# rebuild-and-install.sh regenerates all of it from scratch, fetching
+# kernel source fresh via `apt-get source` each time it's needed.
+build-*/
+stock-module-backup/
+stock-module-backups/
+linux-*/
+linux-signed-*/
+linux_*.orig.tar.gz
+linux_*.diff.gz
+linux_*.dsc
+linux-signed_*.dsc
+linux-signed_*.tar.xz
