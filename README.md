@@ -22,11 +22,13 @@ project's own already-proven dGPU-mode fix (see
 is the fix that actually matters. The other bugs below are real and
 worth fixing regardless, but **none of them, together or alone, were
 ever sufficient without the luminance-capability fix** — confirmed by
-hours of direct hardware-level evidence, not reasoning. The
-load-order fix (`xe-after-nvidia.conf`) is very likely unnecessary now
-and is being kept installed, unchanged, only out of caution until that's
-separately confirmed; don't assume you need it for a similar symptom on
-different hardware.
+hours of direct hardware-level evidence, not reasoning. The load-order
+fix (`xe-after-nvidia.conf`) stays installed, unchanged -- it was found
+through real, careful, reproducible live testing (see "How this was
+found" below) and nothing in this latest investigation disproves that
+it was fixing something real at the time. Whether it's still
+independently necessary alongside the luminance-capability fix is
+genuinely untested, not assumed either way.
 
 Without the real fix, the brightness slider silently does nothing in
 MSHybrid mode: writes succeed as DisplayPort AUX-channel transactions,
@@ -53,10 +55,14 @@ relevant to you too, on any board, with or without NVIDIA/MSHybrid
 involved at all.
 
 The **modprobe load-order fix** (`xe-after-nvidia.conf`) is kept in this
-repo and still installed by `rebuild-and-install.sh`, but is no longer
-believed to be load-bearing -- see "2026-10-23: the real root cause"
-below. Treat it as legacy/unconfirmed-unnecessary rather than part of
-the real fix if you're applying this to different hardware.
+repo and still installed by `rebuild-and-install.sh` -- it was found
+through real, careful, reproducible live testing in September (see "How
+this was found" below), and is left in place unchanged. The
+2026-10-23 investigation (see that section below) found that it alone
+wasn't sufficient for this panel's symptom and isn't the mechanism it
+was once believed to be, but that doesn't mean it was never fixing
+anything real; whether it's still independently necessary alongside the
+luminance-capability fix hasn't been tested either way.
 
 ## Prerequisites (clean Ubuntu install)
 
@@ -253,11 +259,13 @@ after `xe` starts, not exactly 5 seconds after. The practical effect --
 `nvidia_drm`'s connector registration happening well after `xe` has
 completed its own atomic modeset -- is what matters.
 
-**This whole section is very likely describing a red herring, not the
-real fix -- see below.** Kept as-is for historical accuracy about what
-was actually tried, tested, and believed at the time.
+**This section describes real, carefully-tested, reproducible work that
+turned out not to be the mechanism behind this specific panel's
+slider-does-nothing symptom -- see below.** Kept as-is, unchanged, both
+for historical accuracy and because it's still installed and may still
+be doing something real; it just isn't the whole story.
 
-## 2026-10-23: the real root cause, and why the above wasn't it
+## 2026-10-23: a second, separate root cause found
 
 A kernel update eventually surfaced a much more direct test of the
 load-order theory above: on the same panel, same board, with the
