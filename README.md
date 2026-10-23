@@ -2,45 +2,61 @@
 
 Real, hardware OLED brightness control in MSHybrid mode (Intel `xe` GPU
 driving the panel, NVIDIA dGPU present as a PRIME `on-demand` offload
-device) on a Clevo/Tongfang laptop barebone whose eDP panel doesn't set
-`DP_EDP_BACKLIGHT_AUX_ENABLE_CAP`, and whose firmware hands the panel to
-the OS already lit — two separate issues Ubuntu's shipped `xe.ko` gets
-wrong on its own, plus a third, genuinely surprising one: with an NVIDIA
-GPU also present in `on-demand` mode, `xe` never actually switches the
-panel into DPCD-controlled backlight mode at cold boot at all, no matter
-what the driver source does — until this repo's `xe-after-nvidia.conf`
-fixes it by controlling kernel module load order.
+device) on a Clevo/Tongfang laptop barebone.
 
-Without any of this, the brightness slider silently does nothing in
+**Status as of 2026-10-23: the actual root cause is now confirmed.**
+Earlier versions of this README (and a lot of real debugging time)
+believed the fix required controlling kernel module load order
+(`xe-after-nvidia.conf`) on top of two kernel source bugs. That turned
+out to be wrong — see "2026-10-23: the real root cause" below for the
+full story. The actual bug: this panel supports a second, higher-range
+DPCD *luminance* backlight-control mode, but `xe`'s own capability check
+for that mode requires a second capability bit
+(`DP_EDP_SMOOTH_BRIGHTNESS_CAPABLE`) this panel doesn't set, alongside
+the one it does (`DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE`) — so `xe`
+silently fell back to a legacy backlight path that, on this panel,
+writes correctly over DisplayPort AUX but the panel's own controller
+(TCON) never visibly acts on. Relaxing that check to match this
+project's own already-proven dGPU-mode fix (see
+[clevo-control-panel](https://github.com/arbitrary-string/clevo-control-panel))
+is the fix that actually matters. The other bugs below are real and
+worth fixing regardless, but **none of them, together or alone, were
+ever sufficient without the luminance-capability fix** — confirmed by
+hours of direct hardware-level evidence, not reasoning. The
+load-order fix (`xe-after-nvidia.conf`) is very likely unnecessary now
+and is being kept installed, unchanged, only out of caution until that's
+separately confirmed; don't assume you need it for a similar symptom on
+different hardware.
+
+Without the real fix, the brightness slider silently does nothing in
 MSHybrid mode: writes succeed as DisplayPort AUX-channel transactions,
-but the panel's own controller (TCON) is still listening to the legacy
-PWM brightness pin, not the AUX channel, so it never reacts.
+but the panel's own controller (TCON) doesn't visibly react.
 
 ## Is this relevant to your hardware?
 
-The **kernel source patch** (`oled-mshybrid-backlight.patch`) fixes two
-bugs in `drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c` (shared
-display code used by both `i915` and `xe`) that plausibly affect *any*
-eDP panel with the same DPCD capability-bit quirk, on any Intel GPU
-using this driver path — not specific to this exact board. Bug 1
+The **kernel source patch** (`oled-mshybrid-backlight.patch`) fixes
+three bugs in `drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c`
+(shared display code used by both `i915` and `xe`) that plausibly affect
+*any* eDP panel with the same DPCD capability-bit quirks, on any Intel
+GPU using this driver path — not specific to this exact board. Bug 1
 (missing `DP_EDP_BACKLIGHT_AUX_ENABLE_CAP` check removal) was already
 fixed upstream on 2026-07-16 in commit `a411ea4a87`
 ("Remove DP_EDP_BACKLIGHT_AUX_ENABLE_CAP check for DPCD backlight") --
 check if your kernel already has it before patching. Bug 2 (the
 boot-time atomic-readout skip) may or may not be fixed upstream; check
 the "Verifying whether a future kernel already has the fix" section
-below either way.
+below either way. **Bug 3 (the luminance capability gate) is the one
+that actually fixes real-world brightness control on this panel** --
+if your eDP panel advertises `PANEL_LUMINANCE_CONTROL_CAPABLE` (DPCD
+`0x703` bit 4) without `SMOOTH_BRIGHTNESS_CAPABLE`, this is very likely
+relevant to you too, on any board, with or without NVIDIA/MSHybrid
+involved at all.
 
-The **modprobe load-order fix** (`xe-after-nvidia.conf`) is the more
-speculative part: it's confirmed, reproducibly, on this exact
-Panther-Lake-`xe` + NVIDIA-Optimus/MSHybrid-mux laptop, but the deeper
-mechanism (why NVIDIA's `nvidia_drm` module registering its own parallel
-connector for the same physical panel interferes with `xe`'s atomic
-state machine) isn't fully understood at the kernel-source level -- see
-"How this was found" below. If you have a similar Intel+NVIDIA hybrid
-graphics laptop with the same "brightness works after suspend/resume
-but not from a cold boot, only in `on-demand` mode" symptom, it's very
-likely worth trying, but board-specific quirks are always possible.
+The **modprobe load-order fix** (`xe-after-nvidia.conf`) is kept in this
+repo and still installed by `rebuild-and-install.sh`, but is no longer
+believed to be load-bearing -- see "2026-10-23: the real root cause"
+below. Treat it as legacy/unconfirmed-unnecessary rather than part of
+the real fix if you're applying this to different hardware.
 
 ## Prerequisites (clean Ubuntu install)
 
@@ -130,9 +146,10 @@ instead.
 
 ## What the patch does
 
-Two independent bugs in the same function chain
+Three independent bugs in the same function chain
 (`intel_dp_aux_vesa_setup_backlight()`/`_enable_backlight()`/
-`_check_support()`), in `drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c`:
+`intel_dp_aux_supports_vesa_backlight()`), in
+`drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c`:
 
 1. `intel_dp_aux_vesa_check_support()` required both
    `DP_EDP_BACKLIGHT_AUX_ENABLE_CAP` and
@@ -156,6 +173,22 @@ Two independent bugs in the same function chain
    `intel_dp_aux_vesa_setup_backlight()` instead, which (unlike
    `enable`) always runs at boot regardless of that atomic-readout
    optimization.
+3. **The actual fix that matters on this panel**, found 2026-10-23:
+   `intel_dp_aux_supports_vesa_backlight()` only enables the panel's
+   higher-range *luminance* backlight-control mode (DPCD `0x734`,
+   `TARGET_LUMINANCE`) when the panel sets **both**
+   `DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE` (DPCD `0x703` bit 4) *and*
+   `DP_EDP_SMOOTH_BRIGHTNESS_CAPABLE`. This panel sets only the first.
+   Without luminance mode, `xe` uses the legacy path (DPCD `0x722`),
+   which on this panel writes correctly over AUX but produces *no
+   visible effect at all* -- confirmed directly, byte-for-byte identical
+   successful AUX writes whether the panel responds or not. The actual
+   difference: luminance mode also sets DPCD `0x721` bit 7
+   (`DP_EDP_PANEL_LUMINANCE_CONTROL_ENABLE`), which this project's own
+   `clevo-control-panel` already independently proved, via NVIDIA's RM
+   API in dGPU mode, is what makes this panel's TCON actually honor
+   brightness writes at all. Relaxed the check to only require the first
+   capability bit, matching that already-proven fix.
 
 ### Verifying whether a future kernel already has this fix built in
 
@@ -219,6 +252,65 @@ delays is `nvidia_drm.ko`'s own insertion, which lands several seconds
 after `xe` starts, not exactly 5 seconds after. The practical effect --
 `nvidia_drm`'s connector registration happening well after `xe` has
 completed its own atomic modeset -- is what matters.
+
+**This whole section is very likely describing a red herring, not the
+real fix -- see below.** Kept as-is for historical accuracy about what
+was actually tried, tested, and believed at the time.
+
+## 2026-10-23: the real root cause, and why the above wasn't it
+
+A kernel update eventually surfaced a much more direct test of the
+load-order theory above: on the same panel, same board, with the
+load-order fix's underlying mechanism directly instrumented via
+`drm.debug`, a boot with a *provably correct, byte-for-byte identical*
+sequence of DPCD writes (`BACKLIGHT_MODE_SET_REGISTER` at `0x721`,
+brightness level at `0x722`, frequency registers at `0x724`/`0x728`,
+every single AUX transaction returning success, no errors) still left
+the panel completely unresponsive -- while the exact same sequence,
+same values, same success codes, produced a working panel immediately
+after a real suspend/resume. Identical software behavior, different
+hardware outcome. That ruled out *everything* about `xe`'s own AUX
+write path, including the load-order fix above (which only ever
+affected *when* that path ran, not what it did), as the actual
+mechanism -- something about the panel itself wasn't responding to
+otherwise-correct writes.
+
+The missing piece turned out to be sitting in this same project's own
+*other*, already-shipped fix: `clevo-control-panel`'s dGPU-mode OLED
+brightness feature (`oled_luminance.py`) had already independently
+discovered and fixed the exact same panel's real backlight-enable
+mechanism months earlier, using NVIDIA's own RM API instead of `xe`,
+and documented it in its own source comments:
+
+> DPCD `0x721` bit 7 (the "luminance control enable" flag) reads 0 by
+> default. Setting that single bit... immediately unlocked real
+> full-range brightness on this exact panel, live-verified.
+
+`xe`'s own kernel code already has the exact mechanism to set that same
+bit (`drm_edp_backlight_enable()`'s `DP_EDP_PANEL_LUMINANCE_CONTROL_ENABLE`),
+gated behind a `bl->luminance_set` flag that `xe`'s own
+`intel_dp_aux_supports_vesa_backlight()` decides -- and that function
+requires *both* `DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE` and
+`DP_EDP_SMOOTH_BRIGHTNESS_CAPABLE` before even attempting it, while
+`oled_luminance.py`'s own already-proven check only ever required the
+first. `xe`'s own dmesg on this exact panel had, every single boot all
+along, only ever logged the legacy-path message
+(`"AUX Backlight Control Supported!"`), never the luminance-path one
+(`"AUX Luminance Based Backlight Control Supported!"`) -- direct
+confirmation the stricter combined check was failing here the entire
+time. Relaxing it to match the simpler check (bug 3 above) is what
+actually fixed real brightness control: confirmed live, the
+luminance-path message now logs, `max_brightness` reports the real
+luminance scale instead of the legacy one, and the slider works
+correctly from a plain cold boot -- no suspend/resume, no load-order
+tricks.
+
+**The lesson, if you're debugging something similar:** before spending
+hours re-deriving kernel-level behavior from scratch, check whether a
+*different* project against the *same* hardware already solved an
+adjacent version of the same problem -- `oled_luminance.py` had the
+exact DPCD register and bit that mattered sitting in its own source
+comments the entire time this investigation was happening.
 
 ## Superseded approach: boot-time suspend/resume fixup
 
