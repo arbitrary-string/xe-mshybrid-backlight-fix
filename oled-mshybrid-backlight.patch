@@ -47,7 +47,13 @@
 #     Luminance Based Backlight Control Supported!", meaning the stricter
 #     combined check fails here despite the panel demonstrably supporting
 #     luminance control. Relaxed to match the simpler, already-proven
-#     check -- untested as of this commit, first real boot pending.
+#     check -- CONFIRMED WORKING live 2026-10-23 on kernel
+#     7.0.0-38-generic: dmesg now logs "AUX Luminance Based Backlight
+#     Control Supported!" (never once logged before this fix, on any
+#     boot, all night), max_brightness changed from the legacy 4095
+#     scale to 512 (the real luminance scale), and the brightness slider
+#     was confirmed working perfectly after a normal cold boot -- no
+#     suspend/resume, no load-order tricks, no other workaround needed.
 --- a/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
 +++ b/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
 @@ -40,6 +40,7 @@
