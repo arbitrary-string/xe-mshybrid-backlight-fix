@@ -1,6 +1,6 @@
 # MSHybrid OLED backlight patch for xe (Panther Lake iGPU), board L55xJNP.
 #
-# Three pieces:
+# Four pieces:
 #  1. #include "intel_pps.h" -- needed by nothing in this version of the
 #     patch anymore, kept because the build is known-good with it; harmless.
 #  2. intel_dp_aux_vesa_enable_backlight(): MSHYBRID_BACKLIGHT_ENABLE_PROBE
@@ -19,21 +19,35 @@
 #     panel) and skip calling it. Do the same AUX mode-switch + initial
 #     level write right here instead, since setup (unlike enable) always
 #     runs at boot regardless of that optimization.
-#
-#  Deliberately reverted 2026-10-23: a same-night attempt to make this
-#  branch unconditional (never trust current_mode, always enable) and to
-#  also call intel_pps_backlight_on() directly from setup. Neither change
-#  was ever shown to fix anything -- a kernel 7.0.0-38-generic boot with
-#  both still failed identically -- and kernel 7.0.0-34-generic needs
-#  neither to work. Reverted back to this exact, known-good form rather
-#  than carry unconfirmed changes forward, per explicit instruction: don't
-#  pile on fixes when a working example already exists to learn from
-#  first. The current investigation is in intel_dp_aux_vesa_enable_backlight()
-#  itself (see the diagnostic above) -- a -34 boot performs real DPCD
-#  writes (0x721/0x722/0x724/0x728) from inside that function during its
-#  boot-time pipe-enable cycle; a failing -38 boot reaches the same
-#  function, the same pipe-enable cycle, the same link retrain, but
-#  produces none of those writes. That's the actual unexplained gap.
+#  4. intel_dp_aux_supports_vesa_backlight(): MSHYBRID_LUMINANCE_CAP_RELAX
+#     -- the actual fix for the 2026-10-23 saga (see git log for the full,
+#     warts-and-all history of everything tried and reverted before this).
+#     Direct, hard evidence chain: (a) confirmed live via drm.debug that
+#     xe's AUX writes to BACKLIGHT_MODE_SET_REGISTER (0x721) succeed with
+#     correct values on every boot, broken or working, byte-for-byte
+#     identical whether a real suspend/resume follows or not -- the panel
+#     only actually responds after the real suspend/resume, proving xe's
+#     normal AUX write path was never the broken piece; (b) this project's
+#     own already-proven, already-shipped dGPU-mode fix
+#     (clevo-control-panel's oled_luminance.py) documents, for this exact
+#     panel: "DPCD 0x721 bit 7 (the luminance control enable flag) reads 0
+#     by default. Setting that single bit... immediately unlocked real
+#     full-range brightness on this exact panel, live-verified" -- using
+#     NVIDIA's RM API directly, bypassing xe entirely, in dGPU mode; (c)
+#     upstream drm_edp_backlight_enable() already has the exact mechanism
+#     to set that same bit (DP_EDP_PANEL_LUMINANCE_CONTROL_ENABLE), gated
+#     behind a `bl->luminance_set` flag xe's own code decides, not a live
+#     capability probe; (d) xe's own gate for that decision
+#     (intel_dp_aux_supports_vesa_backlight()) requires BOTH
+#     DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE and
+#     DP_EDP_SMOOTH_BRIGHTNESS_CAPABLE, while oled_luminance.py's
+#     already-proven check only ever required the first one -- and xe's
+#     own dmesg on this exact panel has only ever logged the *other*
+#     branch's "AUX Backlight Control Supported!" message, never "AUX
+#     Luminance Based Backlight Control Supported!", meaning the stricter
+#     combined check fails here despite the panel demonstrably supporting
+#     luminance control. Relaxed to match the simpler, already-proven
+#     check -- untested as of this commit, first real boot pending.
 --- a/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
 +++ b/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
 @@ -40,6 +40,7 @@
@@ -95,3 +109,28 @@
  		}
  	} else {
  		panel->backlight.max = panel->backlight.pwm_level_max;
+@@ -644,8 +673,22 @@
+ 	struct intel_dp *intel_dp = intel_attached_dp(connector);
+ 	struct intel_panel *panel = &connector->panel;
+
+-	if ((intel_dp->edp_dpcd[3] & DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE) &&
+-	    (intel_dp->edp_dpcd[3] & DP_EDP_SMOOTH_BRIGHTNESS_CAPABLE)) {
++	/*
++	 * MSHYBRID_LUMINANCE_CAP_RELAX: upstream requires both
++	 * DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE and
++	 * DP_EDP_SMOOTH_BRIGHTNESS_CAPABLE before even attempting luminance
++	 * mode. This panel's own userspace-proven fix
++	 * (clevo-control-panel's oled_luminance.py, confirmed live via the
++	 * NVIDIA RM API in dGPU mode: "Setting that single bit... immediately
++	 * unlocked real full-range brightness on this exact panel") only
++	 * ever checks DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE -- and xe's own
++	 * dmesg here has only ever logged the *other* branch's "AUX Backlight
++	 * Control Supported!" message, never this one, meaning the combined
++	 * && check fails on this panel despite it demonstrably supporting
++	 * luminance control. Relaxed to match the simpler, already-proven
++	 * check.
++	 */
++	if (intel_dp->edp_dpcd[3] & DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE) {
+ 		drm_dbg_kms(display->drm,
+ 			    "[CONNECTOR:%d:%s] AUX Luminance Based Backlight Control Supported!\n",
+ 			    connector->base.base.id, connector->base.name);
