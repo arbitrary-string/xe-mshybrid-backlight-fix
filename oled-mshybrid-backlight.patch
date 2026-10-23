@@ -1,31 +1,43 @@
 --- a/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
 +++ b/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
-@@ -586,8 +586,28 @@
- 			panel->backlight.level = current_level;
- 			panel->backlight.enabled = panel->backlight.level != 0;
- 		} else {
-+			/*
-+			 * Firmware leaves this panel's TCON in legacy PWM
-+			 * mode at boot, not DPCD mode -- normally
-+			 * intel_dp_aux_vesa_enable_backlight() (which writes
-+			 * BACKLIGHT_MODE_SET_REGISTER to actually switch the
-+			 * TCON into DPCD mode) fixes this, but atomic state
-+			 * readout at boot sees the encoder already enabled
-+			 * (inherited from the firmware-lit panel) and skips
-+			 * calling it -- confirmed live: brightness control
-+			 * silently does nothing until the next full
-+			 * enable cycle (e.g. a suspend/resume), which isn't
-+			 * skippable and always calls it. Do the same AUX
-+			 * mode-switch + initial level write right here
-+			 * instead, since setup (unlike enable) always runs
-+			 * at boot regardless of that optimization.
-+			 */
- 			panel->backlight.level = panel->backlight.max;
- 			panel->backlight.enabled = false;
-+			drm_edp_backlight_enable(&intel_dp->aux,
-+						  &panel->backlight.edp.vesa.info,
-+						  panel->backlight.level);
-+			panel->backlight.enabled = true;
- 		}
+@@ -583,12 +583,33 @@
+ 	} else if (panel->backlight.edp.vesa.info.aux_set) {
+ 		panel->backlight.max = panel->backlight.edp.vesa.info.max;
+ 		panel->backlight.min = 0;
+-		if (current_mode == DP_EDP_BACKLIGHT_CONTROL_MODE_DPCD) {
+-			panel->backlight.level = current_level;
+-			panel->backlight.enabled = panel->backlight.level != 0;
+-		} else {
+-			panel->backlight.level = panel->backlight.max;
+-			panel->backlight.enabled = false;
+-		}
++		/*
++		 * MSHYBRID_BACKLIGHT_FORCE_ENABLE: don't trust current_mode
++		 * here to decide whether this panel needs enabling.
++		 * Confirmed live on two otherwise-identical boots of the
++		 * same kernel/hardware: current_mode read PWM (0) on one
++		 * boot (matching this code's original assumption that
++		 * firmware always leaves the TCON in legacy PWM mode) and
++		 * DPCD (2) on another -- yet brightness control was
++		 * broken both times until a real drm_edp_backlight_enable()
++		 * call actually ran (e.g. via suspend/resume, which always
++		 * calls it through intel_dp_aux_vesa_enable_backlight(),
++		 * never skippable there). So current_mode isn't a reliable
++		 * enough signal to branch on for this decision. Always
++		 * (re-)enable here instead, since setup (unlike the
++		 * enable() callback) always runs at boot regardless of the
++		 * atomic-readout skip optimization, and re-asserting an
++		 * already-correct state is harmless.
++		 */
++		drm_dbg_kms(display->drm,
++			    "[CONNECTOR:%d:%s] AUX VESA backlight boot state: current_mode=%d current_level=%u -- forcing enable\n",
++			    connector->base.base.id, connector->base.name,
++			    current_mode, current_level);
++		panel->backlight.level = panel->backlight.max;
++		panel->backlight.enabled = false;
++		drm_edp_backlight_enable(&intel_dp->aux,
++					  &panel->backlight.edp.vesa.info,
++					  panel->backlight.level);
++		panel->backlight.enabled = true;
  	} else {
  		panel->backlight.max = panel->backlight.pwm_level_max;

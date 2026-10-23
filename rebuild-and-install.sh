@@ -86,7 +86,7 @@ echo "Source tree: $SRC_DIR"
 cd "$SRC_DIR"
 
 # --- Apply our patch (skip if already applied -- idempotent re-run) ---
-if grep -q "Firmware leaves this panel's TCON in legacy PWM" \
+if grep -q "MSHYBRID_BACKLIGHT_FORCE_ENABLE" \
     drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c 2>/dev/null; then
     echo "Patch already applied in this build tree, skipping."
 else
