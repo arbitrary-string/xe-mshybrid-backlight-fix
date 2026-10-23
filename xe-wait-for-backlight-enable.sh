@@ -44,34 +44,81 @@
 # Fails open throughout: any missing prerequisite (tracefs genuinely
 # unavailable, function not present in this kernel's xe build) just
 # exits 0 immediately rather than risking blocking boot.
-set -eu
+set -u
 
 TRACE=/sys/kernel/tracing
 FUNC=intel_dp_aux_vesa_enable_backlight
 POLL_INTERVAL_SECONDS=0.2
 MAX_POLL_ITERATIONS=100 # 100 * 0.2s = 20s ceiling
+LOG=/var/log/xe-wait-for-backlight-enable.log
 
-mountpoint -q "$TRACE" 2>/dev/null || mount -t tracefs tracefs "$TRACE" 2>/dev/null || true
+# Temporary diagnostic logging (2026-10-23): this fix has now silently
+# failed at real cold boot twice in a row for two different confirmed
+# reasons, each only found after the fact via indirect evidence (dmesg
+# timestamps, live re-simulation that may not perfectly match the real
+# early-boot environment/sandboxing). Logging exactly what happens at
+# each step, every real boot, until this is confirmed solid across
+# several boots -- direct evidence beats another round of guessing.
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S.%3N')" "$*" >> "$LOG" 2>/dev/null || true; }
 
-[ -d "$TRACE" ] || exit 0
-grep -q "^${FUNC} " "$TRACE/available_filter_functions" 2>/dev/null || exit 0
+log "=== start, PID $$ ==="
 
-echo nop > "$TRACE/current_tracer" 2>/dev/null || exit 0
-: > "$TRACE/set_ftrace_filter" 2>/dev/null || exit 0
-echo "$FUNC" >> "$TRACE/set_ftrace_filter" 2>/dev/null || exit 0
-echo function > "$TRACE/current_tracer" 2>/dev/null || exit 0
-: > "$TRACE/trace" 2>/dev/null || true
+if mountpoint -q "$TRACE" 2>/dev/null; then
+	log "tracefs already mounted"
+else
+	if mount -t tracefs tracefs "$TRACE" 2>>"$LOG"; then
+		log "self-mounted tracefs"
+	else
+		log "FAILED to self-mount tracefs, exit code $?"
+	fi
+fi
+
+if [ ! -d "$TRACE" ]; then
+	log "EXIT: $TRACE still not a directory after mount attempt"
+	exit 0
+fi
+
+if ! grep -q "^${FUNC} " "$TRACE/available_filter_functions" 2>>"$LOG"; then
+	log "EXIT: $FUNC not found in available_filter_functions"
+	exit 0
+fi
+log "confirmed $FUNC is traceable"
+
+if ! echo nop > "$TRACE/current_tracer" 2>>"$LOG"; then
+	log "EXIT: failed to reset current_tracer to nop"
+	exit 0
+fi
+: > "$TRACE/set_ftrace_filter" 2>>"$LOG"
+if ! echo "$FUNC" >> "$TRACE/set_ftrace_filter" 2>>"$LOG"; then
+	log "EXIT: failed to write filter"
+	exit 0
+fi
+if ! echo function > "$TRACE/current_tracer" 2>>"$LOG"; then
+	log "EXIT: failed to enable function tracer"
+	exit 0
+fi
+: > "$TRACE/trace" 2>>"$LOG"
+log "armed: current_tracer=$(cat "$TRACE/current_tracer" 2>/dev/null), filter=$(tr '\n' ',' < "$TRACE/set_ftrace_filter" 2>/dev/null)"
 
 i=0
+found=0
 while [ "$i" -lt "$MAX_POLL_ITERATIONS" ]; do
 	if grep -q "$FUNC" "$TRACE/trace" 2>/dev/null; then
+		found=1
 		break
 	fi
 	sleep "$POLL_INTERVAL_SECONDS"
 	i=$((i + 1))
 done
 
+if [ "$found" -eq 1 ]; then
+	log "DETECTED after $i iterations (~$(awk "BEGIN{print $i*$POLL_INTERVAL_SECONDS}")s): $(grep "$FUNC" "$TRACE/trace" 2>/dev/null | head -3)"
+else
+	log "TIMED OUT after $MAX_POLL_ITERATIONS iterations, never saw $FUNC. Trace buffer tail: $(tail -5 "$TRACE/trace" 2>/dev/null)"
+fi
+
 # Don't leave function tracing permanently armed system-wide just because
 # this ran once during boot.
 echo nop > "$TRACE/current_tracer" 2>/dev/null || true
 : > "$TRACE/set_ftrace_filter" 2>/dev/null || true
+log "=== end ==="
