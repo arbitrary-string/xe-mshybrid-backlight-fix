@@ -1,57 +1,97 @@
+# MSHybrid OLED backlight patch for xe (Panther Lake iGPU), board L55xJNP.
+#
+# Three pieces:
+#  1. #include "intel_pps.h" -- needed by nothing in this version of the
+#     patch anymore, kept because the build is known-good with it; harmless.
+#  2. intel_dp_aux_vesa_enable_backlight(): MSHYBRID_BACKLIGHT_ENABLE_PROBE
+#     diagnostic logging only, no behavior change. Added 2026-10-23 to
+#     find out whether this function -- the real per-enable-cycle
+#     backlight callback -- is even reached on a boot where brightness
+#     ends up broken, and whether drm_edp_backlight_enable() succeeds,
+#     since neither of those facts were visible in dmesg before this.
+#  3. intel_dp_aux_vesa_setup_backlight(): the original, minimal fix from
+#     2026-09-11 -- confirmed working across many boots of kernel
+#     7.0.0-34-generic -- unmodified. Firmware leaves this panel's TCON in
+#     legacy PWM mode at boot, not DPCD mode; intel_dp_aux_vesa_enable_backlight()
+#     (which writes BACKLIGHT_MODE_SET_REGISTER to actually switch the TCON
+#     into DPCD mode) normally fixes this, but atomic state readout at boot
+#     can see the encoder already enabled (inherited from the firmware-lit
+#     panel) and skip calling it. Do the same AUX mode-switch + initial
+#     level write right here instead, since setup (unlike enable) always
+#     runs at boot regardless of that optimization.
+#
+#  Deliberately reverted 2026-10-23: a same-night attempt to make this
+#  branch unconditional (never trust current_mode, always enable) and to
+#  also call intel_pps_backlight_on() directly from setup. Neither change
+#  was ever shown to fix anything -- a kernel 7.0.0-38-generic boot with
+#  both still failed identically -- and kernel 7.0.0-34-generic needs
+#  neither to work. Reverted back to this exact, known-good form rather
+#  than carry unconfirmed changes forward, per explicit instruction: don't
+#  pile on fixes when a working example already exists to learn from
+#  first. The current investigation is in intel_dp_aux_vesa_enable_backlight()
+#  itself (see the diagnostic above) -- a -34 boot performs real DPCD
+#  writes (0x721/0x722/0x724/0x728) from inside that function during its
+#  boot-time pipe-enable cycle; a failing -38 boot reaches the same
+#  function, the same pipe-enable cycle, the same link retrain, but
+#  produces none of those writes. That's the actual unexplained gap.
 --- a/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
 +++ b/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
-@@ -39,6 +39,7 @@
+@@ -40,6 +40,7 @@
  #include "intel_display_core.h"
  #include "intel_display_types.h"
  #include "intel_dp.h"
 +#include "intel_pps.h"
  #include "intel_dp_aux_backlight.h"
 
- /* This function is used to read the current backlight value from DPCD */
-@@ -583,12 +584,39 @@
- 	} else if (panel->backlight.edp.vesa.info.aux_set) {
- 		panel->backlight.max = panel->backlight.edp.vesa.info.max;
- 		panel->backlight.min = 0;
--		if (current_mode == DP_EDP_BACKLIGHT_CONTROL_MODE_DPCD) {
--			panel->backlight.level = current_level;
--			panel->backlight.enabled = panel->backlight.level != 0;
--		} else {
--			panel->backlight.level = panel->backlight.max;
--			panel->backlight.enabled = false;
--		}
-+		/*
-+		 * MSHYBRID_BACKLIGHT_FORCE_ENABLE: don't trust current_mode
-+		 * here to decide whether this panel needs enabling, and
-+		 * don't stop at the AUX/DPCD mode-set either. Confirmed
-+		 * live via drm.debug=0x6: this panel reports aux_enable=0
-+		 * in drm_edp_backlight_init() -- meaning
-+		 * drm_edp_backlight_enable()'s own internal
-+		 * drm_edp_backlight_set_enable() call silently no-ops (see
-+		 * its own comment: "This panel uses the EDP_BL_PWR GPIO for
-+		 * enablement"). So calling drm_edp_backlight_enable() alone,
-+		 * regardless of current_mode, only ever sets the DPCD mode
-+		 * and brightness level -- never the actual hardware on/off
-+		 * gate. That gate is intel_pps_backlight_on(), which writes
-+		 * EDP_BLC_ENABLE directly via MMIO and is normally only
-+		 * reached through a real encoder enable() cycle (which
-+		 * cold boot's atomic-readout optimization skips, but a
-+		 * suspend/resume cycle never does -- matching every
-+		 * symptom observed). Call it directly here too; it only
-+		 * needs intel_dp, which is already in scope, unlike
-+		 * intel_edp_backlight_on() which additionally needs
-+		 * crtc_state/connector_state that don't exist yet this
-+		 * early in boot.
-+		 */
-+		drm_dbg_kms(display->drm,
-+			    "[CONNECTOR:%d:%s] AUX VESA backlight boot state: current_mode=%d current_level=%u -- forcing enable\n",
-+			    connector->base.base.id, connector->base.name,
-+			    current_mode, current_level);
-+		panel->backlight.level = panel->backlight.max;
-+		panel->backlight.enabled = false;
-+		drm_edp_backlight_enable(&intel_dp->aux,
-+					  &panel->backlight.edp.vesa.info,
-+					  panel->backlight.level);
-+		intel_pps_backlight_on(intel_dp);
-+		panel->backlight.enabled = true;
+ /*
+@@ -495,6 +496,27 @@
+ 	struct intel_connector *connector = to_intel_connector(conn_state->connector);
+ 	struct intel_panel *panel = &connector->panel;
+ 	struct intel_dp *intel_dp = enc_to_intel_dp(connector->encoder);
++	struct intel_display *display = to_intel_display(connector);
++	int ret;
++
++	/*
++	 * MSHYBRID_BACKLIGHT_ENABLE_PROBE: diagnostic only, no behavior
++	 * change. Confirmed live (2026-10-23) that on a boot where
++	 * brightness ends up broken, this real enable() callback runs
++	 * (same pipe-enable cycle, same link retrain, same
++	 * intel_backlight_enable() call as a boot where it works) but the
++	 * resulting DPCD writes (0x721/0x722/0x724/0x728) never show up in
++	 * dmesg -- yet drm_edp_backlight_enable() below has no gating
++	 * logic at all and this function has no logging of its own, so
++	 * there was no way to tell whether it was even reached, or what it
++	 * saw, without adding this.
++	 */
++	drm_dbg_kms(display->drm,
++		    "[CONNECTOR:%d:%s] MSHYBRID_BACKLIGHT_ENABLE_PROBE: level=%u aux_set=%d aux_enable=%d luminance_set=%d\n",
++		    connector->base.base.id, connector->base.name, level,
++		    panel->backlight.edp.vesa.info.aux_set,
++		    panel->backlight.edp.vesa.info.aux_enable,
++		    panel->backlight.edp.vesa.info.luminance_set);
+
+ 	if (!(panel->backlight.edp.vesa.info.aux_enable ||
+ 	      panel->backlight.edp.vesa.info.luminance_set)) {
+@@ -509,7 +531,10 @@
+ 		panel->backlight.pwm_funcs->enable(crtc_state, conn_state, pwm_level);
+ 	}
+
+-	drm_edp_backlight_enable(&intel_dp->aux, &panel->backlight.edp.vesa.info, level);
++	ret = drm_edp_backlight_enable(&intel_dp->aux, &panel->backlight.edp.vesa.info, level);
++	drm_dbg_kms(display->drm,
++		    "[CONNECTOR:%d:%s] MSHYBRID_BACKLIGHT_ENABLE_PROBE: drm_edp_backlight_enable returned %d\n",
++		    connector->base.base.id, connector->base.name, ret);
+ }
+
+ static void intel_dp_aux_vesa_disable_backlight(const struct drm_connector_state *old_conn_state,
+@@ -588,6 +613,10 @@
+ 		} else {
+ 			panel->backlight.level = panel->backlight.max;
+ 			panel->backlight.enabled = false;
++			drm_edp_backlight_enable(&intel_dp->aux,
++						  &panel->backlight.edp.vesa.info,
++						  panel->backlight.level);
++			panel->backlight.enabled = true;
+ 		}
  	} else {
  		panel->backlight.max = panel->backlight.pwm_level_max;
