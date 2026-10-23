@@ -26,24 +26,32 @@
 # ones still work correctly, regardless of how fast any future driver
 # version gets.
 #
-# Known residual limitation, not fully closed: there's a narrow
-# theoretical race where xe's own probe (via its own independent udev
-# trigger, not this script) could finish calling enable_backlight in the
-# brief window before this script arms tracing below. Not observed in
-# practice as of this writing. If the bug ever resurfaces despite this
-# fix, that race is the first thing to revisit -- e.g. by arming tracing
-# even earlier, via a persistent kernel command-line ftrace filter set at
-# boot, rather than from this modprobe install hook.
+# Real bug found and fixed 2026-10-23, the first time this script
+# actually hit a cold boot: it did nothing at all. journalctl showed
+# `sys-kernel-tracing.mount`/`sys-kernel-debug.mount` (systemd's own
+# managed mounts for these) didn't actually mount until *several seconds
+# after* nvidia_drm had already initialized -- this script's own
+# `[ -d "$TRACE" ] || exit 0` safety check saw nothing there yet at the
+# point this modprobe install hook actually runs (which happens via
+# early udev coldplug processing, well before systemd gets to mounting
+# these later in boot) and silently exited immediately, turning the
+# whole fix into a no-op. Not the theoretical module-loading race this
+# comment used to warn about -- a much more mundane "the filesystem we
+# need isn't mounted yet" problem. Fixed by mounting tracefs ourselves
+# below instead of depending on systemd's own timing for it; harmless
+# no-op if it's already mounted by the time this runs.
 #
-# Fails open throughout: any missing prerequisite (no tracefs, function
-# not present in this kernel's xe build) just exits 0 immediately rather
-# than risking blocking boot.
+# Fails open throughout: any missing prerequisite (tracefs genuinely
+# unavailable, function not present in this kernel's xe build) just
+# exits 0 immediately rather than risking blocking boot.
 set -eu
 
-TRACE=/sys/kernel/debug/tracing
+TRACE=/sys/kernel/tracing
 FUNC=intel_dp_aux_vesa_enable_backlight
 POLL_INTERVAL_SECONDS=0.2
 MAX_POLL_ITERATIONS=100 # 100 * 0.2s = 20s ceiling
+
+mountpoint -q "$TRACE" 2>/dev/null || mount -t tracefs tracefs "$TRACE" 2>/dev/null || true
 
 [ -d "$TRACE" ] || exit 0
 grep -q "^${FUNC} " "$TRACE/available_filter_functions" 2>/dev/null || exit 0
