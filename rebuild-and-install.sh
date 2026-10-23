@@ -189,14 +189,16 @@ if [ -f "$SCRIPT_DIR/xe-after-nvidia.conf" ]; then
     depmod -a "$KVER"
 fi
 
-# xe-after-nvidia.conf's own `install xe` line calls this script instead
-# of a fixed sleep -- see that file's own comments (2026-10-2x update) for
-# why a flat sleep stopped being reliable once a newer NVIDIA driver made
-# nvidia_drm initialize faster than the old margin assumed.
-if [ -f "$SCRIPT_DIR/xe-wait-for-backlight-enable.sh" ]; then
-    install -m 0755 "$SCRIPT_DIR/xe-wait-for-backlight-enable.sh" \
-        /usr/local/sbin/xe-wait-for-backlight-enable.sh
-fi
+# xe-wait-for-backlight-enable.sh (2026-10-2x, reverted) was a brief
+# attempt to replace the plain `sleep 5` above with a kernel-tracing
+# wait for the real completion signal. It's kept in this repo for
+# reference only -- it's NOT installed anymore. The softdep/install
+# chain in xe-after-nvidia.conf actually executes from inside dracut's
+# initramfs (confirmed: xe.ko is itself embedded there for early-KMS),
+# where /usr/local doesn't exist at all, so anything installed under
+# /usr/local/sbin can never run from this hook. See
+# xe-after-nvidia.conf's own comments for the full story.
+rm -f /usr/local/sbin/xe-wait-for-backlight-enable.sh
 
 # --- Obsolete as of 2026-09-14, superseded by xe-after-nvidia.conf
 # above -- actively disable/clean up rather than leave silently enabled
