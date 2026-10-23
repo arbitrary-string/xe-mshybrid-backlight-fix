@@ -189,6 +189,15 @@ if [ -f "$SCRIPT_DIR/xe-after-nvidia.conf" ]; then
     depmod -a "$KVER"
 fi
 
+# xe-after-nvidia.conf's own `install xe` line calls this script instead
+# of a fixed sleep -- see that file's own comments (2026-10-2x update) for
+# why a flat sleep stopped being reliable once a newer NVIDIA driver made
+# nvidia_drm initialize faster than the old margin assumed.
+if [ -f "$SCRIPT_DIR/xe-wait-for-backlight-enable.sh" ]; then
+    install -m 0755 "$SCRIPT_DIR/xe-wait-for-backlight-enable.sh" \
+        /usr/local/sbin/xe-wait-for-backlight-enable.sh
+fi
+
 # --- Obsolete as of 2026-09-14, superseded by xe-after-nvidia.conf
 # above -- actively disable/clean up rather than leave silently enabled
 # if an earlier install left it that way. Files kept in this repo for
