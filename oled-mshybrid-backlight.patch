@@ -1,6 +1,6 @@
 # MSHybrid OLED backlight patch for xe (Panther Lake iGPU), board L55xJNP.
 #
-# Four pieces:
+# Five pieces:
 #  1. #include "intel_pps.h" -- needed by nothing in this version of the
 #     patch anymore, kept because the build is known-good with it; harmless.
 #  2. intel_dp_aux_vesa_enable_backlight(): MSHYBRID_BACKLIGHT_ENABLE_PROBE
@@ -54,17 +54,53 @@
 #     scale to 512 (the real luminance scale), and the brightness slider
 #     was confirmed working perfectly after a normal cold boot -- no
 #     suspend/resume, no load-order tricks, no other workaround needed.
+#  5. MSHYBRID_LUMINANCE_REASSERT (added 2026-10-26, intel_dp_aux_backlight.c
+#     + .h + intel_display_debugfs.c): the capability-relax fix above got
+#     brightness working on cold boot, but confirmed live that it stops
+#     working again after a suspend/resume -- the DPCD 0x721 luminance-
+#     enable bit gets cleared by something after xe's own enable_backlight()
+#     path already correctly re-wrote it (confirmed via drm.debug: the
+#     right value lands at 0x721 multiple times during a real resume, panel
+#     still ends up unresponsive). This exact bug was already found and
+#     fixed once, on the dGPU-mode NVIDIA-RM-API path for this identical
+#     panel/register (clevo-control-panel's oled_luminance_daemon.py):
+#     "resets as a side effect of *any* Mutter display mode-set," not
+#     confined to one catchable trigger, fixed there with a periodic,
+#     idempotent reassert rather than trying to enumerate every cause.
+#     xe has no public interface for a cheap, targeted single-register DPCD
+#     write the way NVIDIA's RM API gives userspace (confirmed: no raw AUX
+#     debugfs path exists here beyond i915_dp_force_link_retrain, which
+#     forces a full, heavier link retrain -- confirmed live that triggering
+#     it produced no dmesg activity at all when the link was already
+#     considered trained, so it isn't even a reliable lever here). Adds a
+#     new debugfs file, `mshybrid_luminance_reassert` (0644, same
+#     per-connector debugfs directory as the existing i915_dp_* entries),
+#     that does the same minimal, idempotent read-then-write
+#     oled_luminance.py's own enable_luminance_mode() does: read
+#     BACKLIGHT_MODE_SET_REGISTER, write it back with the luminance-enable
+#     bit added only if it isn't already set. A no-op on any connector not
+#     actually using luminance mode. Intended to be polled by a small
+#     userspace reassert service (not yet built as of this commit) the same
+#     way oled_luminance_daemon.py polls on the dGPU side.
 --- a/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
 +++ b/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c
-@@ -40,6 +40,7 @@
+@@ -34,12 +34,15 @@
+  * for some reason.
+  */
+ 
++#include <linux/debugfs.h>
++
+ #include <drm/drm_print.h>
+ 
+ #include "intel_backlight.h"
  #include "intel_display_core.h"
  #include "intel_display_types.h"
  #include "intel_dp.h"
 +#include "intel_pps.h"
  #include "intel_dp_aux_backlight.h"
-
+ 
  /*
-@@ -495,6 +496,27 @@
+@@ -495,6 +498,27 @@
  	struct intel_connector *connector = to_intel_connector(conn_state->connector);
  	struct intel_panel *panel = &connector->panel;
  	struct intel_dp *intel_dp = enc_to_intel_dp(connector->encoder);
@@ -89,22 +125,22 @@
 +		    panel->backlight.edp.vesa.info.aux_set,
 +		    panel->backlight.edp.vesa.info.aux_enable,
 +		    panel->backlight.edp.vesa.info.luminance_set);
-
+ 
  	if (!(panel->backlight.edp.vesa.info.aux_enable ||
  	      panel->backlight.edp.vesa.info.luminance_set)) {
-@@ -509,7 +531,10 @@
+@@ -509,7 +533,10 @@
  		panel->backlight.pwm_funcs->enable(crtc_state, conn_state, pwm_level);
  	}
-
+ 
 -	drm_edp_backlight_enable(&intel_dp->aux, &panel->backlight.edp.vesa.info, level);
 +	ret = drm_edp_backlight_enable(&intel_dp->aux, &panel->backlight.edp.vesa.info, level);
 +	drm_dbg_kms(display->drm,
 +		    "[CONNECTOR:%d:%s] MSHYBRID_BACKLIGHT_ENABLE_PROBE: drm_edp_backlight_enable returned %d\n",
 +		    connector->base.base.id, connector->base.name, ret);
  }
-
+ 
  static void intel_dp_aux_vesa_disable_backlight(const struct drm_connector_state *old_conn_state,
-@@ -588,6 +613,10 @@
+@@ -588,6 +615,10 @@
  		} else {
  			panel->backlight.level = panel->backlight.max;
  			panel->backlight.enabled = false;
@@ -115,10 +151,10 @@
  		}
  	} else {
  		panel->backlight.max = panel->backlight.pwm_level_max;
-@@ -644,8 +673,22 @@
+@@ -644,8 +675,22 @@
  	struct intel_dp *intel_dp = intel_attached_dp(connector);
  	struct intel_panel *panel = &connector->panel;
-
+ 
 -	if ((intel_dp->edp_dpcd[3] & DP_EDP_PANEL_LUMINANCE_CONTROL_CAPABLE) &&
 -	    (intel_dp->edp_dpcd[3] & DP_EDP_SMOOTH_BRIGHTNESS_CAPABLE)) {
 +	/*
@@ -140,3 +176,116 @@
  		drm_dbg_kms(display->drm,
  			    "[CONNECTOR:%d:%s] AUX Luminance Based Backlight Control Supported!\n",
  			    connector->base.base.id, connector->base.name);
+@@ -754,3 +799,85 @@
+ 
+ 	return -ENODEV;
+ }
++
++/*
++ * MSHYBRID_LUMINANCE_REASSERT: confirmed live 2026-10-26 that this exact
++ * panel's DPCD 0x721 luminance-control-enable bit gets cleared by *something*
++ * during/after a suspend/resume cycle -- xe's own enable_backlight() path
++ * already correctly re-writes it (confirmed via drm.debug: the right value
++ * lands at 0x721 multiple times during a real resume), but the panel still
++ * ends up unresponsive afterward, meaning the clear happens *after* those
++ * writes, outside anything xe's own atomic-commit machinery re-triggers on
++ * its own. This mirrors a bug already found and fixed once before, on the
++ * dGPU-mode NVIDIA-RM-API path for this identical panel/bit
++ * (clevo-control-panel's oled_luminance_daemon.py, SAFETY_REASSERT_SECONDS):
++ * "DPCD 0x721's luminance-mode-enable bit gets reset as a side effect of
++ * *any* Mutter display mode-set" -- not confined to one catchable trigger,
++ * so a periodic, idempotent reassert is what actually worked there, not
++ * trying to enumerate every cause. xe has no public interface for a cheap,
++ * targeted single-register DPCD write the way NVIDIA's RM API gives
++ * userspace (confirmed: no raw AUX debugfs path exists here beyond the much
++ * heavier i915_dp_force_link_retrain, which forces a full link retrain).
++ * This debugfs entry exists to let a small userspace reassert service do
++ * the same minimal, idempotent read-then-write oled_luminance.py's own
++ * enable_luminance_mode() does, without needing a full link retrain or
++ * driver reload: read the mode-set register, write it back with the
++ * luminance-enable bit added only if it isn't already set. A no-op, safe to
++ * poll frequently, on any connector that isn't actually using luminance mode
++ * at all (panel->backlight.edp.vesa.info.luminance_set false).
++ */
++static int mshybrid_luminance_reassert_show(void *data, u64 *val)
++{
++	struct intel_connector *connector = to_intel_connector(data);
++	struct intel_panel *panel = &connector->panel;
++
++	*val = panel->backlight.edp.vesa.info.luminance_set;
++
++	return 0;
++}
++
++static int mshybrid_luminance_reassert_write(void *data, u64 val)
++{
++	struct intel_connector *connector = to_intel_connector(data);
++	struct intel_display *display = to_intel_display(connector);
++	struct intel_dp *intel_dp = intel_attached_dp(connector);
++	struct intel_panel *panel = &connector->panel;
++	u8 mode = 0;
++	int ret;
++
++	if (!panel->backlight.edp.vesa.info.luminance_set)
++		return -ENODEV;
++
++	mutex_lock(&display->backlight.lock);
++
++	ret = drm_dp_dpcd_read_byte(&intel_dp->aux, DP_EDP_BACKLIGHT_MODE_SET_REGISTER, &mode);
++	if (ret < 0)
++		goto out;
++
++	if (!(mode & DP_EDP_PANEL_LUMINANCE_CONTROL_ENABLE))
++		ret = drm_dp_dpcd_write_byte(&intel_dp->aux, DP_EDP_BACKLIGHT_MODE_SET_REGISTER,
++					      mode | DP_EDP_PANEL_LUMINANCE_CONTROL_ENABLE);
++
++out:
++	mutex_unlock(&display->backlight.lock);
++
++	drm_dbg_kms(display->drm,
++		    "[CONNECTOR:%d:%s] MSHYBRID_LUMINANCE_REASSERT: mode=0x%02x ret=%d\n",
++		    connector->base.base.id, connector->base.name, mode, ret);
++
++	return ret < 0 ? ret : 0;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(mshybrid_luminance_reassert_fops,
++			 mshybrid_luminance_reassert_show,
++			 mshybrid_luminance_reassert_write, "%llu\n");
++
++void intel_dp_aux_backlight_debugfs_add(struct intel_connector *connector)
++{
++	struct dentry *root = connector->base.debugfs_entry;
++
++	if (connector->base.connector_type != DRM_MODE_CONNECTOR_eDP)
++		return;
++
++	debugfs_create_file("mshybrid_luminance_reassert", 0644, root,
++			    connector, &mshybrid_luminance_reassert_fops);
++}
+--- a/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.h
++++ b/drivers/gpu/drm/i915/display/intel_dp_aux_backlight.h
+@@ -9,5 +9,6 @@
+ struct intel_connector;
+ 
+ int intel_dp_aux_init_backlight_funcs(struct intel_connector *intel_connector);
++void intel_dp_aux_backlight_debugfs_add(struct intel_connector *connector);
+ 
+ #endif /* __INTEL_DP_AUX_BACKLIGHT_H__ */
+--- a/drivers/gpu/drm/i915/display/intel_display_debugfs.c
++++ b/drivers/gpu/drm/i915/display/intel_display_debugfs.c
+@@ -31,6 +31,7 @@
+ #include "intel_display_types.h"
+ #include "intel_dmc.h"
+ #include "intel_dp.h"
++#include "intel_dp_aux_backlight.h"
+ #include "intel_dp_link_training.h"
+ #include "intel_dp_mst.h"
+ #include "intel_dp_test.h"
+@@ -1334,6 +1335,7 @@
+ 	intel_alpm_lobf_debugfs_add(connector);
+ 	intel_dp_link_training_debugfs_add(connector);
+ 	intel_link_bw_connector_debugfs_add(connector);
++	intel_dp_aux_backlight_debugfs_add(connector);
+ 
+ 	if (DISPLAY_VER(display) >= 11 &&
+ 	    ((connector_type == DRM_MODE_CONNECTOR_DisplayPort && !connector->mst.dp) ||
