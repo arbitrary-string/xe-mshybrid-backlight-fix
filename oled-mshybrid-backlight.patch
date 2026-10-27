@@ -1,5 +1,28 @@
 # MSHybrid OLED backlight patch for xe (Panther Lake iGPU), board L55xJNP.
 #
+# STATUS as of 2026-10-26: this entire patch may no longer be necessary.
+# The real fix for this panel's full backlight story (working on cold
+# boot AND surviving a real suspend/resume) turned out to be xe's own
+# built-in enable_dpcd_backlight=3 module parameter, which forces Intel's
+# own proprietary DPCD backlight interface instead of the VESA interface
+# every single piece of this patch touches -- see xe-dpcd-backlight.conf
+# for the full story, found live by the user, not through more kernel
+# patching. The VESA-interface code path this patch modifies works fine
+# from a cold boot but does not reliably survive a real suspend/resume
+# on this exact panel (confirmed live: every DPCD register checkable
+# from the host side reads back correctly written post-resume, matching
+# the user's slider in real time, panel still visibly unresponsive --
+# pointing at a TCON-firmware-level limitation in VESA mode specifically,
+# not anything fixable via more patching). Once value 3 is set, xe's own
+# decision logic (intel_dp_aux_init_backlight_funcs(), which checks the
+# Intel-proprietary-interface branch before the VESA-interface branch
+# this patch exclusively touches) should mean none of this patch's VESA-
+# path changes are even reached anymore -- not yet independently
+# confirmed against a fully stock xe.ko, since the live system this was
+# found on still had this patch's custom module loaded at the time.
+# Kept installed and in this repo rather than torn out immediately,
+# pending that confirmation.
+#
 # Five pieces:
 #  1. #include "intel_pps.h" -- needed by nothing in this version of the
 #     patch anymore, kept because the build is known-good with it; harmless.

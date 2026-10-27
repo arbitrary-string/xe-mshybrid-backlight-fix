@@ -189,6 +189,20 @@ if [ -f "$SCRIPT_DIR/xe-after-nvidia.conf" ]; then
     depmod -a "$KVER"
 fi
 
+# The actual fix for cold-boot-vs-suspend/resume backlight reliability,
+# found 2026-10-26, not anything in this script's own patch: xe's own
+# built-in enable_dpcd_backlight=3 module parameter forces Intel's own
+# proprietary DPCD backlight interface instead of the VESA one this
+# repo's kernel patch exclusively touches -- see xe-dpcd-backlight.conf's
+# own comments for the full story (the VESA interface works from a cold
+# boot but doesn't reliably survive a real suspend/resume on this exact
+# panel; Intel's own interface does both).
+if [ -f "$SCRIPT_DIR/xe-dpcd-backlight.conf" ]; then
+    install -m 0644 "$SCRIPT_DIR/xe-dpcd-backlight.conf" \
+        /etc/modprobe.d/xe-dpcd-backlight.conf
+    depmod -a "$KVER"
+fi
+
 # xe-wait-for-backlight-enable.sh (2026-10-2x, reverted) was a brief
 # attempt to replace the plain `sleep 5` above with a kernel-tracing
 # wait for the real completion signal. It's kept in this repo for
