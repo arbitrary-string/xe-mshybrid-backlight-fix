@@ -3,6 +3,15 @@
 # oled-mshybrid-backlight.patch in this same directory) for a given
 # kernel, and installs it in place of the stock module.
 #
+# CONFIRMED 2026-10-26: this patch (and therefore this whole build) is
+# not needed on this board. xe-dpcd-backlight.conf's enable_dpcd_backlight=3
+# alone, on a fully stock xe.ko, fixes brightness control on both cold
+# boot and after suspend/resume -- tested directly. Run
+# `sudo install -m 0644 xe-dpcd-backlight.conf /etc/modprobe.d/ && sudo
+# update-initramfs -u && sudo reboot` instead; see README.md. This script
+# is kept working as a fallback (e.g. if a future kernel/firmware update
+# ever breaks the simple parameter fix), not as the primary path anymore.
+#
 # Run this once after every kernel update that replaces the currently
 # patched kernel -- there is no DKMS automation for this. xe.ko turned
 # out not to fit DKMS's usual model at all: building it needs the FULL

@@ -4,24 +4,24 @@ Real, hardware OLED brightness control in MSHybrid mode (Intel `xe` GPU
 driving the panel, NVIDIA dGPU present as a PRIME `on-demand` offload
 device) on a Clevo/Tongfang laptop barebone.
 
-**Status as of 2026-10-26: try `xe-dpcd-backlight.conf` first, before
-this patch.** This whole kernel patch may not be necessary at all. The
-actual fix that works reliably on both a cold boot *and* after a real
-suspend/resume, found live, not through more patching: `xe`'s own
-built-in `enable_dpcd_backlight=3` module parameter, which forces
-Intel's own proprietary DPCD backlight interface instead of the VESA
-interface every piece of this patch touches. The VESA interface works
-fine from a cold boot on this panel but does not reliably survive a
-real suspend/resume -- confirmed live, every DPCD register checkable
-from the host side reads back correctly written post-resume, matching
-the brightness slider in real time, and the panel is still visibly
-unresponsive. That points at a TCON-firmware-level limitation in VESA
-mode specifically on this panel, not something more kernel patching can
-fix. See `xe-dpcd-backlight.conf`'s own comments, and "2026-10-26: the
-simpler fix that actually survives suspend/resume" below, for the full
-story. **Try that one config file change first** -- `sudo install -m
-0644 xe-dpcd-backlight.conf /etc/modprobe.d/ && sudo update-initramfs -u
-&& sudo reboot` -- before attempting this repo's kernel patch at all.
+**Status as of 2026-10-26: CONFIRMED -- you almost certainly don't need
+this kernel patch at all.** The actual fix, which works reliably on
+both a cold boot *and* after a real suspend/resume, is a single
+pre-existing `xe` module parameter: `enable_dpcd_backlight=3`, which
+forces Intel's own proprietary DPCD backlight interface instead of the
+VESA interface every piece of this patch touches. Tested directly
+against a fully stock, unpatched `xe.ko` (module swapped back in,
+checksum-verified against the original stock backup) -- no patch,
+no load-order tricks, nothing else: the brightness slider worked
+perfectly on both cold boot and after suspend/resume. See
+`xe-dpcd-backlight.conf`'s own comments, and "2026-10-26: the simpler
+fix that actually survives suspend/resume" below, for the full story
+including why the VESA interface this patch targets doesn't reliably
+survive a real suspend/resume on this exact panel. **Just do this:**
+`sudo install -m 0644 xe-dpcd-backlight.conf /etc/modprobe.d/ && sudo
+update-initramfs -u && sudo reboot`. The rest of this repo (the kernel
+patch, the build script, the load-order fix) is kept for reference and
+as a fallback, not because it's required.
 
 **Status as of 2026-10-23 (superseded by the above, kept for history):**
 Earlier versions of this README (and a lot of real debugging time)
@@ -392,16 +392,38 @@ having tried the other.
 Setting `enable_dpcd_backlight=3` (see `xe-dpcd-backlight.conf`) fixed
 brightness control on both a cold boot and after a real suspend/resume,
 found live by the user -- not confirmed through more kernel source
-investigation first. **Not yet independently verified:** whether value
-3 alone is sufficient against a fully *stock*, unpatched `xe.ko` -- the
-live system this was found on still had this repo's custom module
-loaded at the time. Since the Intel-interface branch is checked before
-the VESA-interface branch this patch modifies, and value 3 only enables
-the former, this patch's own changes should never even be reached once
-this value is set -- but that's reasoning from source, not a confirmed
-test. This patch is kept in the repo and still installed by
-`rebuild-and-install.sh` pending that confirmation, but try
-`xe-dpcd-backlight.conf` alone first on any new install.
+investigation first.
+
+**CONFIRMED, same day:** value 3 alone is sufficient against a fully
+*stock*, unpatched `xe.ko` -- no kernel patch needed at all. Backed up
+the then-running patched module, swapped a stock `xe.ko` back in
+(checksum-verified identical to the original stock backup, both as
+installed and as embedded in the regenerated initramfs), rebooted with
+only `xe-dpcd-backlight.conf` in place, and tested both cold boot and a
+real suspend/resume cycle. User's own words: *"Hilarious - the
+brightness controls work perfectly on boot as well as resuming from
+suspend."* This matches the reasoning-from-source prediction above (the
+Intel-interface branch is checked before the VESA-interface branch this
+patch modifies, so this patch's changes are never reached once value 3
+is set) -- `oled-mshybrid-backlight.patch` is confirmed unnecessary for
+this board. It's kept in the repo, and still buildable via
+`rebuild-and-install.sh`, purely as reference / a fallback if a future
+kernel or firmware update ever breaks the simple parameter fix. **Use
+`xe-dpcd-backlight.conf` alone; that's the entire fix.**
+
+**Process note, for anyone reading this history:** this fix is a
+one-line module parameter, documented upstream and well known in the
+Linux DPCD-backlight community, that would have taken five minutes to
+find with a web search for the exact symptom. Everything above it in
+this README -- weeks of kernel-source patching, a custom debugfs hook,
+two "final resolution" writeups that each turned out to be incomplete
+-- happened because that search was never done early, and because an
+earlier, superficially similar fix (the VESA-interface luminance-mode
+bit, from this same project's dGPU work) was assumed to be the only
+relevant mechanism. If you hit a backlight-control oddity on an
+Intel/`xe` or `i915` system, check `modinfo xe` / the contents of
+`/sys/module/xe/parameters/` and search for the exact symptom *before*
+reading driver source or writing a patch.
 
 ## Superseded approach: boot-time suspend/resume fixup
 

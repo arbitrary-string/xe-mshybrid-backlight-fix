@@ -1,10 +1,16 @@
 # MSHybrid OLED backlight patch for xe (Panther Lake iGPU), board L55xJNP.
 #
-# STATUS as of 2026-10-26: this entire patch may no longer be necessary.
-# The real fix for this panel's full backlight story (working on cold
-# boot AND surviving a real suspend/resume) turned out to be xe's own
-# built-in enable_dpcd_backlight=3 module parameter, which forces Intel's
-# own proprietary DPCD backlight interface instead of the VESA interface
+# STATUS as of 2026-10-26: CONFIRMED NOT NEEDED. Tested directly: backed
+# up the running patched module, swapped a fully *stock* (unpatched)
+# xe.ko back in (checksum-verified against the original stock backup,
+# both as installed and as embedded in the regenerated initramfs), with
+# only xe-dpcd-backlight.conf's enable_dpcd_backlight=3 in place -- no
+# patch at all. Rebooted; user confirmed live: "the brightness controls
+# work perfectly on boot as well as resuming from suspend." So the real
+# fix for this panel's full backlight story (working on cold boot AND
+# surviving a real suspend/resume) is entirely xe's own built-in
+# enable_dpcd_backlight=3 module parameter, which forces Intel's own
+# proprietary DPCD backlight interface instead of the VESA interface
 # every single piece of this patch touches -- see xe-dpcd-backlight.conf
 # for the full story, found live by the user, not through more kernel
 # patching. The VESA-interface code path this patch modifies works fine
@@ -13,15 +19,12 @@
 # from the host side reads back correctly written post-resume, matching
 # the user's slider in real time, panel still visibly unresponsive --
 # pointing at a TCON-firmware-level limitation in VESA mode specifically,
-# not anything fixable via more patching). Once value 3 is set, xe's own
-# decision logic (intel_dp_aux_init_backlight_funcs(), which checks the
-# Intel-proprietary-interface branch before the VESA-interface branch
-# this patch exclusively touches) should mean none of this patch's VESA-
-# path changes are even reached anymore -- not yet independently
-# confirmed against a fully stock xe.ko, since the live system this was
-# found on still had this patch's custom module loaded at the time.
-# Kept installed and in this repo rather than torn out immediately,
-# pending that confirmation.
+# not anything fixable via more patching). Kept in this repo, and
+# rebuild-and-install.sh still builds/installs it on request, as
+# reference and a fallback (e.g. if a future kernel/firmware update ever
+# breaks the simple parameter fix) -- not because it's still required for
+# this board. The currently-running kernel uses a fully stock xe.ko; this
+# patch is not loaded.
 #
 # Five pieces:
 #  1. #include "intel_pps.h" -- needed by nothing in this version of the
